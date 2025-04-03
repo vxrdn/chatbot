@@ -5,8 +5,7 @@ from typing import List, Optional, Dict, Any
 import openai
 import os
 from sqlalchemy import create_engine, Column, Integer, String, Float, Text, DateTime
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import sessionmaker, Session, declarative_base
 import datetime
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
@@ -98,8 +97,8 @@ def get_optimized_prompt(db: Session, prompt_id: Optional[int] = None):
         return db.query(Prompt).filter(Prompt.id == prompt_id).first()
     return db.query(Prompt).order_by(Prompt.performance_score.desc()).first()
 
-def generate_ai_response(message: str, prompt_content: str):
-    """Generate response from Gemini API"""
+def generate_ai_response(message: str, prompt_content: str, db: Session = None, user_id: str = None):
+    """Generate response from Gemini API with conversation history"""
     try:
         # Configure the model
         generation_config = {
@@ -115,8 +114,16 @@ def generate_ai_response(message: str, prompt_content: str):
             generation_config=generation_config
         )
         
-        # Create the prompt by combining system prompt and user message
-        combined_prompt = f"{prompt_content}\n\nUser: {message}"
+        # Add conversation history if available
+        conversation_history = ""
+        if db and user_id:
+            conversation_history = get_user_conversation_history(db, user_id)
+        
+        # Create the prompt by combining system prompt, conversation history, and user message
+        if conversation_history:
+            combined_prompt = f"{prompt_content}\n\nPrevious conversation:\n{conversation_history}\n\nUser: {message}"
+        else:
+            combined_prompt = f"{prompt_content}\n\nUser: {message}"
         
         # Generate the response
         response = model.generate_content(combined_prompt)
@@ -200,6 +207,24 @@ def optimize_prompt(db: Session, prompt_id: int):
         except Exception as e:
             print(f"Failed to optimize prompt: {str(e)}")
 
+def get_user_conversation_history(db: Session, user_id: str, limit: int = 5):
+    """Get recent conversation history for a user"""
+    previous_conversations = (
+        db.query(Conversation)
+        .filter(Conversation.user_id == user_id)
+        .order_by(Conversation.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    
+    # Format conversations as a string
+    conversation_history = ""
+    for conv in reversed(previous_conversations):  # Reverse to get chronological order
+        conversation_history += f"User: {conv.user_message}\n"
+        conversation_history += f"Assistant: {conv.bot_response}\n\n"
+    
+    return conversation_history
+
 # API Endpoints
 @app.post("/chat", response_model=MessageResponse)
 def chat(message_request: MessageRequest, db: Session = Depends(get_db)):
@@ -217,8 +242,13 @@ def chat(message_request: MessageRequest, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(prompt)
     
-    # Generate AI response
-    response = generate_ai_response(message_request.message, prompt.content)
+    # Generate AI response with conversation history
+    response = generate_ai_response(
+        message_request.message, 
+        prompt.content,
+        db=db,
+        user_id=message_request.user_id
+    )
     
     # Save the conversation
     conversation = Conversation(
